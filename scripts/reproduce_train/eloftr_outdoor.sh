@@ -1,5 +1,6 @@
 #!/bin/bash -l
 
+
 SCRIPTPATH=$(dirname $(readlink -f "$0"))
 PROJECT_DIR="${SCRIPTPATH}/../../"
 
@@ -11,9 +12,9 @@ cd $PROJECT_DIR
 TRAIN_IMG_SIZE=832
 
 n_nodes=1
-n_gpus_per_node=4
-torch_num_workers=4
-batch_size=5
+n_gpus_per_node=3
+torch_num_workers=12
+batch_size=2
 pin_memory=true
 
 DEFAULT_EXP_NAME=''

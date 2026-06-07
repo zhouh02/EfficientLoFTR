@@ -9,4 +9,8 @@ tmp.*
 
 logs/
 weights/
-dump/
+dump/data/megadepth/
+data/*/index/
+*.pkl
+*.h5
+*.npy
