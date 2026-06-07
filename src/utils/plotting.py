@@ -72,8 +72,8 @@ def _make_evaluation_figure(data, b_id, alpha='dynamic'):
     
     img0 = (data['image0'][b_id][0].cpu().numpy() * 255).round().astype(np.int32)
     img1 = (data['image1'][b_id][0].cpu().numpy() * 255).round().astype(np.int32)
-    kpts0 = data['mkpts0_f'][b_mask].cpu().numpy()
-    kpts1 = data['mkpts1_f'][b_mask].cpu().numpy()
+    kpts0 = data['mkpts0_f'][b_mask].detach().cpu().numpy()
+    kpts1 = data['mkpts1_f'][b_mask].detach().cpu().numpy()
     
     # for megadepth, we visualize matches on the resized image
     if 'scale0' in data:

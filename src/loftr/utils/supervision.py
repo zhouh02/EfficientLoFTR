@@ -242,7 +242,7 @@ def spvs_fine(data, config, logger = None):
         expec_f_gt = delta_w_pt0_f - delta_w_pt0_f_round
         
         if m_ids.numel() == 0:  # special case: there is no pixel-level gt
-            loguru_logger.warning(f"No groundtruth fine match found for local regress: {data['pair_names']}")
+            loguru_logger.debug(f"No groundtruth fine match found for local regress: {data['pair_names']}")
             # this won't affect fine-level loss calculation
             data.update({'expec_f': torch.zeros(1, 2, device=device)})
             data.update({'expec_f_gt': torch.zeros(1, 2, device=device)})
@@ -265,7 +265,7 @@ def spvs_fine(data, config, logger = None):
             data.update({'conf_matrix_f_error_gt': w_pt0_f_error})
             
         if  conf_matrix_f_gt.sum() == 0:
-            loguru_logger.info(f'no fine matches to supervise')
+            loguru_logger.debug(f'no fine matches to supervise')
                 
 def compute_supervision_fine(data, config, logger=None):
     data_source = data['dataset_name'][0]
