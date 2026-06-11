@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls d:/GitCode/ 2>/dev/null | head -30)",
+      "Read(//d/GitCode/**)"
+    ]
+  }
+}
