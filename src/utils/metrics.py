@@ -47,6 +47,48 @@ def symmetric_epipolar_distance(pts0, pts1, E, K0, K1):
     d = p1Ep0**2 * (1.0 / (Ep0[:, 0]**2 + Ep0[:, 1]**2) + 1.0 / (Etp1[:, 0]**2 + Etp1[:, 1]**2))  # N
     return d
 
+def sym_epipolar_distance(p0, p1, E, squared=True):
+    """Compute batched symmetric epipolar distances.
+    Args:
+        p0, p1: batched tensors of N 2D points of size (..., N, 2).
+        E: essential matrices from camera 0 to camera 1, size (..., 3, 3).
+    Returns:
+        The symmetric epipolar distance of each point-pair: (..., N).
+    """
+    assert p0.shape[-2] == p1.shape[-2]
+    if p0.shape[-2] == 0:
+        return torch.zeros(p0.shape[:-1]).to(p0)
+    if p0.shape[-1] != 3:
+        p0 = to_homogeneous(p0)
+    if p1.shape[-1] != 3:
+        p1 = to_homogeneous(p1)
+    p1_E_p0 = torch.einsum("...ni,...ij,...nj->...n", p1, E, p0)
+    E_p0 = torch.einsum("...ij,...nj->...ni", E, p0)
+    Et_p1 = torch.einsum("...ij,...ni->...nj", E, p1)
+    d0 = (E_p0[..., 0] ** 2 + E_p0[..., 1] ** 2).clamp(min=1e-6)
+    d1 = (Et_p1[..., 0] ** 2 + Et_p1[..., 1] ** 2).clamp(min=1e-6)
+    if squared:
+        d = p1_E_p0**2 * (1 / d0 + 1 / d1)
+    else:
+        d = p1_E_p0.abs() * (1 / d0.sqrt() + 1 / d1.sqrt()) / 2
+    return d
+
+def to_homogeneous(points):
+    """Convert N-dimensional points to homogeneous coordinates.
+    Args:
+        points: torch.Tensor or numpy.ndarray with size (..., N).
+    Returns:
+        A torch.Tensor or numpy.ndarray with size (..., N+1).
+    """
+    if isinstance(points, torch.Tensor):
+        pad = points.new_ones(points.shape[:-1] + (1,))
+        return torch.cat([points, pad], dim=-1)
+    elif isinstance(points, np.ndarray):
+        pad = np.ones((points.shape[:-1] + (1,)), dtype=points.dtype)
+        return np.concatenate([points, pad], axis=-1)
+    else:
+        raise ValueError
+
 
 def compute_symmetrical_epipolar_errors(data):
     """ 
@@ -69,6 +111,56 @@ def compute_symmetrical_epipolar_errors(data):
 
     data.update({'epi_errs': epi_errs})
 
+def compute_all_symmetrical_epipolar_errors(data, thr=1.5): # thr=1.5
+    """ 
+    Update:
+        data (dict):{"epi_errs": [M]}
+    """
+    Tx = numeric.cross_product_matrix(data['T_0to1'][:, :3, 3])
+    E_mat = Tx @ data['T_0to1'][:, :3, :3]
+
+    bids = data['b_ids']
+    pts0 = data['all_mkpts0_f']
+    pts1 = data['all_mkpts1_f']
+    loss = torch.zeros(bids.shape[0], device=bids.device, dtype=torch.float32)
+    K0 = data['K0']
+    K1 = data['K1']
+    threshold = thr / ((K0[:, 0, 0] + K0[:, 1, 1] +K1[:, 0, 0] + K1[:, 1, 1])/4) #[b]
+    thresholdsq = threshold ** 2
+    # epi_errs = []
+    for bs in range(Tx.size(0)):
+        mask = bids == bs
+        epi_errs = symmetric_epipolar_distance(pts0[mask], pts1[mask], E_mat[bs], K0[bs], K1[bs])
+        loss[mask] = torch.where(epi_errs < thresholdsq[bs], epi_errs/thresholdsq[bs], torch.ones_like(loss[mask]))
+        
+    return loss
+
+def compute_all_symmetrical_epipolar_errors_mask(data, thr=1.5):
+    """ 
+    Update:
+        data (dict):{"epi_errs": [M]}
+    """
+    Tx = numeric.cross_product_matrix(data['T_0to1'][:, :3, 3])
+    E_mat = Tx @ data['T_0to1'][:, :3, :3]
+
+    bids = data['b_ids']
+    pts0 = data['all_mkpts0_f']
+    pts1 = data['all_mkpts1_f']
+    epi_errs = torch.zeros(bids.shape[0], device=bids.device, dtype=torch.float32)
+    K0 = data['K0']
+    K1 = data['K1']
+    threshold = thr / ((K0[:, 0, 0] + K0[:, 1, 1] +K1[:, 0, 0] + K1[:, 1, 1])/4) #[b]
+    thresholdsq = threshold ** 2
+    loss_mask = torch.zeros(bids.shape[0], device=bids.device, dtype=torch.bool)
+    # epi_errs = []
+    for bs in range(Tx.size(0)):
+        mask = bids == bs
+        epi_errs_bs = symmetric_epipolar_distance(pts0[mask], pts1[mask], E_mat[bs], K0[bs], K1[bs])
+        epi_errs[mask] = epi_errs_bs / thresholdsq[bs]
+        loss_mask[mask] = epi_errs_bs < thresholdsq[bs]
+        
+    return epi_errs, loss_mask
+
 
 def estimate_pose(kpts0, kpts1, K0, K1, thresh, conf=0.99999):
     if len(kpts0) < 5:
@@ -83,6 +175,7 @@ def estimate_pose(kpts0, kpts1, K0, K1, thresh, conf=0.99999):
     # compute pose with cv2
     E, mask = cv2.findEssentialMat(
         kpts0, kpts1, np.eye(3), threshold=ransac_thr, prob=conf, method=cv2.RANSAC)
+        
     if E is None:
         print("\nE is None while trying to recover pose.\n")
         return None
@@ -96,6 +189,36 @@ def estimate_pose(kpts0, kpts1, K0, K1, thresh, conf=0.99999):
             ret = (R, t[:, 0], mask.ravel() > 0)
             best_num_inliers = n
 
+    return ret
+
+def estimate_pose_from_E(kpts0, kpts1, K0, K1, E, mask):
+    # assert E is not None
+
+    if len(kpts0) < 5 or E is None:
+	    return None
+    
+    # normalize keypoints
+    
+    kpts0 = (kpts0 - K0[[0, 1], [2, 2]][None]) / K0[[0, 1], [0, 1]][None]
+    kpts1 = (kpts1 - K1[[0, 1], [2, 2]][None]) / K1[[0, 1], [0, 1]][None]
+
+    E = E.astype(np.float64)
+    kpts0 = kpts0.astype(np.float64)
+    kpts1 = kpts1.astype(np.float64)
+    I = np.eye(3).astype(np.float64)
+    mask = mask.astype(np.uint8)
+
+    best_num_inliers = 0
+    ret = None
+
+    for _E in np.split(E, len(E) / 3):
+
+        n, R, t, _ = cv2.recoverPose(
+            _E, kpts0, kpts1, I, 1e9, mask=mask)
+
+        if n > best_num_inliers:
+            best_num_inliers = n
+            ret = (R, t[:, 0], mask.ravel() > 0)
     return ret
 
 
@@ -148,9 +271,14 @@ def compute_pose_errors(data, config):
     m_bids = data['m_bids'].cpu().numpy()
     pts0 = data['mkpts0_f'].cpu().numpy()
     pts1 = data['mkpts1_f'].cpu().numpy()
+    
     K0 = data['K0'].cpu().numpy()
     K1 = data['K1'].cpu().numpy()
     T_0to1 = data['T_0to1'].cpu().numpy()
+
+    
+
+   
 
     for bs in range(K0.shape[0]):
         mask = m_bids == bs
@@ -164,7 +292,9 @@ def compute_pose_errors(data, config):
                     continue
                 bpts0 = bpts0[shuffling]
                 bpts1 = bpts1[shuffling]
-                
+
+              
+
                 if RANSAC == 'RANSAC':
                     ret = estimate_pose(bpts0, bpts1, K0[bs], K1[bs], pixel_thr, conf=conf)
                     if ret is None:
@@ -191,14 +321,30 @@ def compute_pose_errors(data, config):
                         R_list.append(r_error)
                         T_list.append(t_error)
                         inliers_list.append(inl)
+                elif RANSAC == 'w8pt':
+                    if data['res_e_hat'] != None:
+                        res_e_hat = data['res_e_hat'].reshape(3,3).cpu().numpy()
+                    else:
+                        res_e_hat = None
+                    ret = estimate_pose_from_E(bpts0, bpts1, K0[bs], K1[bs], res_e_hat, inlier_mask)
+                    if ret is None:
+                        R_list.append(np.inf)
+                        T_list.append(np.inf)
+                        inliers_list.append(np.array([]).astype(bool))
+                    else:
+                        R, t, inliers = ret
+                        t_err, R_err = relative_pose_error(T_0to1[bs], R, t, ignore_gt_t_thr=0.0)
+                        R_list.append(R_err)
+                        T_list.append(t_err)
+                        inliers_list.append(inliers)
                 else:
                     raise ValueError(f"Unknown RANSAC method: {RANSAC}")
 
             data['R_errs'].append(R_list)
             data['t_errs'].append(T_list)
             data['inliers'].append(inliers_list[0])
-
-
+    
+   
 # --- METRIC AGGREGATION ---
 
 def error_auc(errors, thresholds):
@@ -235,7 +381,7 @@ def epidist_prec(errors, thresholds, ret_dict=False):
         return precs
 
 
-def aggregate_metrics(metrics, epi_err_thr=5e-4, config=None):
+def aggregate_metrics(metrics, epi_err_thr=1e-4, config=None):
     """ Aggregate metrics for the whole dataset:
     (This method should be called once per dataset)
     1. AUC of the pose error (angular) at the threshold [5, 10, 20]

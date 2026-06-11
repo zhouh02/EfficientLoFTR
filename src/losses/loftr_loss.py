@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from kornia.geometry.subpix import dsnt
 from kornia.utils.grid import create_meshgrid
+from ..utils.metrics import compute_all_symmetrical_epipolar_errors
 
 
 class LoFTRLoss(nn.Module):
@@ -29,7 +30,44 @@ class LoFTRLoss(nn.Module):
         self.local_regressw = self.config['loftr']['fine_window_size']
         self.local_regress_temperature = self.config['loftr']['match_fine']['local_regress_temperature']
         
+        # ✅ 删除：双边损失配置（这不是 CoMatch 的）
+        # self.use_bilateral_loss = ...
+        # self.bilateral_weight = ...
+        # self.similarity_weight = ...
 
+    def class_focal_loss(self, x, target, mask=None):
+        x = torch.clamp(x, min=1e-6, max=1 - 1e-6)
+        alpha = 0.25
+        gamma = 2.0
+        
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+            pos_mask, neg_mask = (target == 1) * mask, (target == 0) * mask
+        else:
+            pos_mask, neg_mask = (target == 1), (target == 0)
+
+        del target
+        
+        loss_pos = -alpha * torch.pow(1 - x[pos_mask],
+                                      gamma) * (x[pos_mask]).log()
+        loss_neg = (-(1 - alpha) * torch.pow(x[neg_mask], gamma) *
+                    (1 - x[neg_mask]).log())
+
+        loss_pos = loss_pos
+        loss_neg = loss_neg
+        c_pos_w = c_neg_w = 1.0
+
+        with torch.no_grad():
+            precision = torch.sum(x[pos_mask] > 0.5) / torch.sum((x[pos_mask+neg_mask]>0.5)+1e-6)
+            recall = torch.sum(x[pos_mask] > 0.5) / (x[pos_mask].numel()+1e-6)
+
+        if len(loss_pos) > 0 and len(loss_neg) > 0:
+            return c_pos_w * loss_pos.mean() + c_neg_w * loss_neg.mean(), precision, recall
+        elif len(loss_pos) > 0:
+            return c_pos_w * loss_pos.mean(), precision, recall
+        else:
+            return c_neg_w * loss_neg.mean(), precision, recall
+    
     def compute_coarse_loss(self, conf, conf_gt, weight=None, overlap_weight=None):
         """ Point-wise CE / Focal Loss with 0 / 1 confidence as gt.
         Args:
@@ -39,8 +77,8 @@ class LoFTRLoss(nn.Module):
         """
         pos_mask, neg_mask = conf_gt == 1, conf_gt == 0
         del conf_gt
-        # logger.info(f'real sum of conf_matrix_c_gt: {pos_mask.sum().item()}')
         c_pos_w, c_neg_w = self.c_pos_w, self.c_neg_w
+        
         # corner case: no gt coarse-level match at all
         if not pos_mask.any():  # assign a wrong gt
             pos_mask[0, 0, 0] = True
@@ -61,51 +99,45 @@ class LoFTRLoss(nn.Module):
             if self.sparse_spvs:
                 pos_conf = conf[pos_mask]
                 loss_pos = - alpha * torch.pow(1 - pos_conf, gamma) * pos_conf.log()
-                # handle loss weights
                 if weight is not None:
-                    # Different from dense-spvs, the loss w.r.t. padded regions aren't directly zeroed out,
-                    # but only through manually setting corresponding regions in sim_matrix to '-inf'.
                     loss_pos = loss_pos * weight[pos_mask]
                 if self.overlap_weightc:
-                    loss_pos = loss_pos * overlap_weight # already been masked slice in supervision
+                    loss_pos = loss_pos * overlap_weight
 
                 loss = c_pos_w * loss_pos.mean()
                 return loss
             else:  # dense supervision
                 loss_pos = - alpha * torch.pow(1 - conf[pos_mask], gamma) * (conf[pos_mask]).log()
                 loss_neg = - alpha * torch.pow(conf[neg_mask], gamma) * (1 - conf[neg_mask]).log()
-                logger.info("conf_pos_c: {loss_pos}, conf_neg_c: {loss_neg}".format(loss_pos=conf[pos_mask].mean(), loss_neg=conf[neg_mask].mean()))
                 if weight is not None:
                     loss_pos = loss_pos * weight[pos_mask]
                     loss_neg = loss_neg * weight[neg_mask]
                 if self.overlap_weightc:
-                    loss_pos = loss_pos * overlap_weight # already been masked slice in supervision
+                    loss_pos = loss_pos * overlap_weight
 
                 loss_pos_mean, loss_neg_mean = loss_pos.mean(), loss_neg.mean()
-                logger.info("conf_pos_c: {loss_pos}, conf_neg_c: {loss_neg}".format(loss_pos=conf[pos_mask].mean(), loss_neg=conf[neg_mask].mean()))
                 return c_pos_w * loss_pos_mean + c_neg_w * loss_neg_mean
-                # each negative element occupy a smaller propotion than positive elements. => higher negative loss weight needed
         else:
             raise ValueError('Unknown coarse loss: {type}'.format(type=self.loss_config['coarse_type']))
 
     def compute_fine_loss(self, conf_matrix_f, conf_matrix_f_gt, overlap_weight=None):
         """
         Args:
-            conf_matrix_f (torch.Tensor): [m, WW, WW] <x, y>
-            conf_matrix_f_gt (torch.Tensor): [m, WW, WW] <x, y>
+            conf_matrix_f (torch.Tensor): [M, WW, WW]
+            conf_matrix_f_gt (torch.Tensor): [M, WW, WW]
         """
         if conf_matrix_f_gt.shape[0] == 0:
-            if self.training:  # this seldomly happen during training, since we pad prediction with gt
-                            # sometimes there is not coarse-level gt at all.
+            if self.training:
                 logger.warning("assign a false supervision to avoid ddp deadlock")
                 pass
             else:
                 return None
+        
         pos_mask, neg_mask = conf_matrix_f_gt == 1, conf_matrix_f_gt == 0
         del conf_matrix_f_gt
         c_pos_w, c_neg_w = self.c_pos_w, self.c_neg_w
         
-        if not pos_mask.any():  # assign a wrong gt
+        if not pos_mask.any():
             pos_mask[0, 0, 0] = True
             c_pos_w = 0.
         if not neg_mask.any():
@@ -119,18 +151,24 @@ class LoFTRLoss(nn.Module):
         if self.fine_sparse_spvs:
             loss_pos = - alpha * torch.pow(1 - conf[pos_mask], gamma) * (conf[pos_mask]).log()
             if self.overlap_weightf:
-                loss_pos = loss_pos * overlap_weight # already been masked slice in supervision
+                loss_pos = loss_pos * overlap_weight
             return c_pos_w * loss_pos.mean()
         else:
             loss_pos = - alpha * torch.pow(1 - conf[pos_mask], gamma) * (conf[pos_mask]).log()
             loss_neg = - alpha * torch.pow(conf[neg_mask], gamma) * (1 - conf[neg_mask]).log()
-            logger.info("conf_pos_f: {loss_pos}, conf_neg_f: {loss_neg}".format(loss_pos=conf[pos_mask].mean(), loss_neg=conf[neg_mask].mean()))
             if self.overlap_weightf:
-                loss_pos = loss_pos * overlap_weight # already been masked slice in supervision
+                loss_pos = loss_pos * overlap_weight
 
             return c_pos_w * loss_pos.mean() + c_neg_w * loss_neg.mean()
 
-    
+    def _compute_local_loss_epipolar(self, data):
+        """ 
+        Update:
+            data (dict):{"epi_errs": [M']}
+        """
+        loss = compute_all_symmetrical_epipolar_errors(data)
+        return loss.mean()
+
     def _compute_local_loss_l2(self, expec_f, expec_f_gt):
         """
         Args:
@@ -139,13 +177,17 @@ class LoFTRLoss(nn.Module):
         """
         correct_mask = torch.linalg.norm(expec_f_gt, ord=float('inf'), dim=1) < self.correct_thr
         if correct_mask.sum() == 0:
-            if self.training:  # this seldomly happen when training, since we pad prediction with gt
+            if self.training:
                 logger.warning("assign a false supervision to avoid ddp deadlock")
                 correct_mask[0] = True
             else:
                 return None
         offset_l2 = ((expec_f_gt[correct_mask] - expec_f[correct_mask]) ** 2).sum(-1)
         return offset_l2.mean()
+    
+    # ✅ 删除：_compute_bilateral_loss 函数（这不是 CoMatch 的）
+    # def _compute_bilateral_loss(self, data):
+    #     ...
     
     @torch.no_grad()
     def compute_c_weight(self, data):
@@ -168,14 +210,47 @@ class LoFTRLoss(nn.Module):
         # 0. compute element-wise loss weight
         c_weight = self.compute_c_weight(data)
 
+        # Matchability loss
+        P_list0, R_list0 = [], []
+        P_list1, R_list1 = [], []
+        matchablity_loss00, matchablity_loss11 = data['matchability_score_list0'][-1].new_tensor(0.0), data['matchability_score_list1'][-1].new_tensor(0.0),
+        for i in range(len(data['matchability_score_list0'])):
+            matchablity_loss0, precision0, recall0  = self.class_focal_loss(
+                data['matchability_score_list0'][i], 
+                data['spv_matchability_map0'],  
+                data.get('mask0', None))
+            matchablity_loss00 += matchablity_loss0
+            
+            matchablity_loss1, precision1, recall1  = self.class_focal_loss(
+                data['matchability_score_list1'][i], 
+                data['spv_matchability_map1'],  
+                data.get('mask1', None))
+            matchablity_loss11 += matchablity_loss1
+
+            P_list0.append(precision0)
+            R_list0.append(recall0)
+            P_list1.append(precision1)
+            R_list1.append(recall1)
+
+        matchablity_loss = (matchablity_loss00 + matchablity_loss11) / len(data['matchability_score_list0'])
+        loss_scalars.update({"precision0_2": P_list0[-2].clone().detach().cpu()})
+        loss_scalars.update({"recall0_2": R_list0[-2].clone().detach().cpu()})
+        loss_scalars.update({"precision1_2": P_list1[-2].clone().detach().cpu()})
+        loss_scalars.update({"recall1_2": R_list1[-2].clone().detach().cpu()})
+        loss_scalars.update({"precision0": P_list0[-1].clone().detach().cpu()})
+        loss_scalars.update({"recall0": R_list0[-1].clone().detach().cpu()})
+        loss_scalars.update({"precision1": P_list1[-1].clone().detach().cpu()})
+        loss_scalars.update({"recall1": R_list1[-1].clone().detach().cpu()})
+        del P_list0, P_list1, R_list0, R_list1
+
         # 1. coarse-level loss
         if self.overlap_weightc:
             loss_c = self.compute_coarse_loss(
                 data['conf_matrix_with_bin'] if self.sparse_spvs and self.match_type == 'sinkhorn' \
                     else data['conf_matrix'],
                 data['conf_matrix_gt'],
-                weight=c_weight, overlap_weight=data['conf_matrix_error_gt'])
-        
+                weight=c_weight, 
+                overlap_weight=data['conf_matrix_error_gt'])
         else:
             loss_c = self.compute_coarse_loss(
                 data['conf_matrix_with_bin'] if self.sparse_spvs and self.match_type == 'sinkhorn' \
@@ -188,42 +263,39 @@ class LoFTRLoss(nn.Module):
         
         # 2. pixel-level loss (first-stage refinement)
         if self.overlap_weightf:
-            loss_f = self.compute_fine_loss(data['conf_matrix_f'], data['conf_matrix_f_gt'], data['conf_matrix_f_error_gt'])
+            loss_f = self.compute_fine_loss(
+                data['conf_matrix_f'], 
+                data['conf_matrix_f_gt'], 
+                data['conf_matrix_f_error_gt'])
         else:
-            loss_f = self.compute_fine_loss(data['conf_matrix_f'], data['conf_matrix_f_gt'])
+            loss_f = self.compute_fine_loss(
+                data['conf_matrix_f'], 
+                data['conf_matrix_f_gt'])
+        
         if loss_f is not None:
             loss += loss_f * self.loss_config['fine_weight']
             loss_scalars.update({"loss_f":  loss_f.clone().detach().cpu()})
         else:
             assert self.training is False
-            loss_scalars.update({'loss_f': torch.tensor(1.)})  # 1 is the upper bound
+            loss_scalars.update({'loss_f': torch.tensor(1.)})
 
         # 3. subpixel-level loss (second-stage refinement)
-        # we calculate subpixel-level loss for all pixel-level gt
+        # ✅ 恢复到 CoMatch 原版：简单的单向 local loss
         if 'expec_f' not in data:
-            sim_matrix_f, m_ids, i_ids, j_ids_di, j_ids_dj = data['sim_matrix_ff'], data['m_ids_f'], data['i_ids_f'], data['j_ids_f_di'], data['j_ids_f_dj']
-            del data['sim_matrix_ff'], data['m_ids_f'], data['i_ids_f'], data['j_ids_f_di'], data['j_ids_f_dj']
-            delta = create_meshgrid(3, 3, True, sim_matrix_f.device).to(torch.long) # [1, 3, 3, 2]
-            m_ids = m_ids[...,None,None].expand(-1, 3, 3)
-            i_ids = i_ids[...,None,None].expand(-1, 3, 3)
-            # Note that j_ids_di & j_ids_dj in (i, j) format while delta in (x, y) format
-            j_ids_di = j_ids_di[...,None,None].expand(-1, 3, 3) + delta[None, ..., 1]
-            j_ids_dj = j_ids_dj[...,None,None].expand(-1, 3, 3) + delta[None, ..., 0]
-
-            sim_matrix_f = sim_matrix_f.reshape(-1, self.local_regressw*self.local_regressw, self.local_regressw+2, self.local_regressw+2) # [M, WW, W+2, W+2]
-            sim_matrix_f = sim_matrix_f[m_ids, i_ids, j_ids_di, j_ids_dj]
-            sim_matrix_f = sim_matrix_f.reshape(-1, 9)
-
-            sim_matrix_f = F.softmax(sim_matrix_f / self.local_regress_temperature, dim=-1)
-            heatmap = sim_matrix_f.reshape(-1, 3, 3)
-            
-            # compute coordinates from heatmap
-            coords_normalized = dsnt.spatial_expectation2d(heatmap[None], True)[0]
-            data.update({'expec_f': coords_normalized})
-        loss_l = self._compute_local_loss_l2(data['expec_f'], data['expec_f_gt'])
+            loss_l = self._compute_local_loss_epipolar(data)
+        else:
+            loss_l = self._compute_local_loss_l2(data['expec_f'], data['expec_f_gt'])
 
         loss += loss_l * self.loss_config['local_weight']
         loss_scalars.update({"loss_l":  loss_l.clone().detach().cpu()})
+
+        # ✅ 删除：双边损失部分（这不是 CoMatch 的）
+        # if self.use_bilateral_loss and 'all_mkpts0_f' in data and 'all_mkpts1_f' in data:
+        #     ...
+
+        # 4. matchability loss
+        loss += matchablity_loss * 0.25
+        loss_scalars.update({"loss_cls": matchablity_loss.clone().detach().cpu()})
 
         loss_scalars.update({'loss': loss.clone().detach().cpu()})
         data.update({"loss": loss, "loss_scalars": loss_scalars})

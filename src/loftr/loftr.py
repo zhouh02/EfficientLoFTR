@@ -3,7 +3,7 @@ import torch.nn as nn
 from einops.einops import rearrange
 
 from .backbone import build_backbone
-from .loftr_module import LocalFeatureTransformer, FinePreprocess
+from .loftr_module import LocalFeatureTransformer, FinePreprocess, LocalFeatureTransformer_loftr
 from .utils.coarse_matching import CoarseMatching
 from .utils.fine_matching import FineMatching
 from ..utils.misc import detect_NaN
@@ -37,6 +37,7 @@ class LoFTR(nn.Module):
         self.coarse_matching = CoarseMatching(config['match_coarse'])
         self.fine_preprocess = FinePreprocess(config)
         self.fine_matching = FineMatching(config)
+        self.loftr_fine = LocalFeatureTransformer_loftr(config["fine"])
 
     def forward(self, data):
         """ 
@@ -86,7 +87,12 @@ class LoFTR(nn.Module):
         if 'mask0' in data:
             mask_c0, mask_c1 = data['mask0'], data['mask1']
 
-        feat_c0, feat_c1 = self.loftr_coarse(feat_c0, feat_c1, mask_c0, mask_c1)
+        # feat_c0, feat_c1 = self.loftr_coarse(feat_c0, feat_c1, mask_c0, mask_c1)
+        feat_c0, feat_c1, matchability_score_list0, matchability_score_list1 = self.loftr_coarse(feat_c0, feat_c1, mask_c0, mask_c1)
+        data.update({
+            'matchability_score_list0': matchability_score_list0,
+            'matchability_score_list1': matchability_score_list1,
+        })
 
         feat_c0 = rearrange(feat_c0, 'n c h w -> n (h w) c')
         feat_c1 = rearrange(feat_c1, 'n c h w -> n (h w) c')
@@ -113,6 +119,9 @@ class LoFTR(nn.Module):
             detect_NaN(feat_f0_unfold, feat_f1_unfold)
         
         del feat_c0, feat_c1, mask_c0, mask_c1
+
+        if feat_f0_unfold.size(0) != 0:  # at least one coarse level predicted
+            feat_f0_unfold, feat_f1_unfold = self.loftr_fine(feat_f0_unfold, feat_f1_unfold)
 
         # 5. match fine-level            
         self.fine_matching(feat_f0_unfold, feat_f1_unfold, data)

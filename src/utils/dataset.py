@@ -127,7 +127,7 @@ def read_megadepth_gray(path, resize=None, df=None, padding=False, augment_fn=No
 
 
 def read_megadepth_depth(path, pad_to=None):
-    if str(path).startswith('s3://'):
+    if str(path).startswith('s3://'):  
         depth = load_array_from_s3(path, MEGADEPTH_CLIENT, None, use_h5py=True)
     else:
         depth = np.array(h5py.File(path, 'r')['depth'])
@@ -136,7 +136,7 @@ def read_megadepth_depth(path, pad_to=None):
     depth = torch.from_numpy(depth).float()  # (h, w)
     return depth
 
-
+  
 # --- ScanNet ---
 
 def read_scannet_gray(path, resize=(640, 480), augment_fn=None):
@@ -151,6 +151,11 @@ def read_scannet_gray(path, resize=(640, 480), augment_fn=None):
     """
     # read and resize image
     image = imread_gray(path, augment_fn)
+    if image is None:
+        raise ValueError(f"cannot read image: (image is None)! please check dataload is exist or not: {path}")
+
+    if image.size == 0:
+        raise ValueError(f"image read is empty (size is 0)! dataroad: {image}")
     image = cv2.resize(image, resize)
 
     # (h, w) -> (1, h, w) and normalized

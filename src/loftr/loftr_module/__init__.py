@@ -1,2 +1,2 @@
-from .transformer import LocalFeatureTransformer
+from .transformer import LocalFeatureTransformer,LocalFeatureTransformer_loftr
 from .fine_preprocess import FinePreprocess

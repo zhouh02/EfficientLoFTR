@@ -71,6 +71,10 @@ class PL_LoFTR(pl.LightningModule):
         self.end_event = torch.cuda.Event(enable_timing=True)
         self.total_ms = 0
 
+        for p in self.parameters():
+            if p.requires_grad:
+                p.data = p.data.contiguous()
+
     def configure_optimizers(self):
         # FIXME: The scheduler did not work properly when `--resume_from_checkpoint`
         optimizer = build_optimizer(self, self.config)
@@ -144,11 +148,11 @@ class PL_LoFTR(pl.LightningModule):
                 self.logger.experiment.add_scalar(f'train/{k}', v, self.global_step)
 
             # figures
-            if self.config.TRAINER.ENABLE_PLOTTING:
-                compute_symmetrical_epipolar_errors(batch)  # compute epi_errs for each match
-                figures = make_matching_figures(batch, self.config, self.config.TRAINER.PLOT_MODE)
-                for k, v in figures.items():
-                    self.logger.experiment.add_figure(f'train_match/{k}', v, self.global_step)
+            ##if self.config.TRAINER.ENABLE_PLOTTING:
+            ##    compute_symmetrical_epipolar_errors(batch)  # compute epi_errs for each match
+            ##    figures = make_matching_figures(batch, self.config, self.config.TRAINER.PLOT_MODE)
+            ##    for k, v in figures.items():
+            ##        self.logger.experiment.add_figure(f'train_match/{k}', v, self.global_step)
         return {'loss': batch['loss']}
 
     def training_epoch_end(self, outputs):
@@ -166,11 +170,12 @@ class PL_LoFTR(pl.LightningModule):
         
         ret_dict, _ = self._compute_metrics(batch)
         
-        val_plot_interval = max(self.trainer.num_val_batches[0] // self.n_vals_plot, 1)
-        figures = {self.config.TRAINER.PLOT_MODE: []}
-        if batch_idx % val_plot_interval == 0:
-            figures = make_matching_figures(batch, self.config, mode=self.config.TRAINER.PLOT_MODE)
-
+        ##val_plot_interval = max(self.trainer.num_val_batches[0] // self.n_vals_plot, 1)
+        ##figures = {self.config.TRAINER.PLOT_MODE: []}
+        ##if batch_idx % val_plot_interval == 0:
+        ##    figures = make_matching_figures(batch, self.config, mode=self.config.TRAINER.PLOT_MODE)
+        figures = {}
+        
         return {
             **ret_dict,
             'loss_scalars': batch['loss_scalars'],
@@ -214,11 +219,11 @@ class PL_LoFTR(pl.LightningModule):
                 for k, v in val_metrics_4tb.items():
                     self.logger.experiment.add_scalar(f"metrics_{valset_idx}/{k}", v, global_step=cur_epoch)
                 
-                for k, v in figures.items():
-                    if self.trainer.global_rank == 0:
-                        for plot_idx, fig in enumerate(v):
-                            self.logger.experiment.add_figure(
-                                f'val_match_{valset_idx}/{k}/pair-{plot_idx}', fig, cur_epoch, close=True)
+                ##for k, v in figures.items():
+                ##    if self.trainer.global_rank == 0:
+                ##        for plot_idx, fig in enumerate(v):
+                ##            self.logger.experiment.add_figure(
+                ##                f'val_match_{valset_idx}/{k}/pair-{plot_idx}', fig, cur_epoch, close=True)
             plt.close('all')
 
         for thr in [5, 10, 20]:

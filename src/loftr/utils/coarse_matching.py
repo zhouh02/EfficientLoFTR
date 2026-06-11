@@ -65,7 +65,9 @@ class CoarseMatching(nn.Module):
         # general config
         self.thr = config['thr']
         self.border_rm = config['border_rm']
-        self.temperature = config['dsmax_temperature']
+        
+        
+        self.temperature=nn.parameter.Parameter(torch.tensor(0.1), requires_grad=True)
         self.skip_softmax = config['skip_softmax']
         self.fp16matmul = config['fp16matmul']
         # -- # for trainig fine-level LoFTR
@@ -120,7 +122,8 @@ class CoarseMatching(nn.Module):
             sim_matrix = sim_matrix
         else:
             sim_matrix = F.softmax(sim_matrix, 1) * F.softmax(sim_matrix, 2)
-
+       
+        
         data.update({'conf_matrix': sim_matrix})
 
         # predict coarse matches from conf_matrix
@@ -224,18 +227,22 @@ class CoarseMatching(nn.Module):
         scale1 = scale * data['scale1'][b_ids] if 'scale1' in data else scale
         mkpts0_c = torch.stack(
             [i_ids % data['hw0_c'][1], i_ids // data['hw0_c'][1]],
-            dim=1) * scale0
+            dim=1) * scale0 
         mkpts1_c = torch.stack(
             [j_ids % data['hw1_c'][1], j_ids // data['hw1_c'][1]],
-            dim=1) * scale1
+            dim=1) * scale1 
 
         m_bids = b_ids[mconf != 0]        
         # These matches is the current prediction (for visualization)
+
         coarse_matches.update({
             'm_bids': m_bids,  # mconf == 0 => gt matches
+            'all_mkpts0_c': mkpts0_c,
+            'all_mkpts1_c': mkpts1_c,
             'mkpts0_c': mkpts0_c[mconf != 0],
             'mkpts1_c': mkpts1_c[mconf != 0],
             'mconf': mconf[mconf != 0]
         })
+        
 
         return coarse_matches
