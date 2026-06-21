@@ -1,0 +1,12 @@
+{
+  "run": 9,
+  "status": "ok",
+  "return_code": 0,
+  "duration_sec": 267.773722410202,
+  "log_path": "/ssd-data3/zh2025/EfficientLoFTR/scripts/reproduce_test/eval_20_eloftr_orin/logs/run_009.log",
+  "auc@10": 0.7167899317885726,
+  "auc@20": 0.8315516972175084,
+  "auc@5": 0.555452238683585,
+  "num_matches": 3236.668,
+  "prec@1e-04": 0.952302113736762
+}

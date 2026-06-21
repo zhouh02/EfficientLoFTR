@@ -13,7 +13,7 @@ n_gpus_per_node=-1
 torch_num_workers=4
 batch_size=1  # per gpu
 
-ckpt_path="weights/eloftr_outdoor.ckpt"
+ckpt_path="/ssd-data3/zh2025/EfficientLoFTR/logs/tb_logs/eloftr_orin/version_0/checkpoints/epoch=31-auc@5=0.540-auc@10=0.702-auc@20=0.819.ckpt"
 
 dump_dir="dump/eloftr_full_megadepth"
 data_cfg_path="configs/data/megadepth_test_1500.py"
