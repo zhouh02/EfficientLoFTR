@@ -1,3 +1,10 @@
+import os
+os.environ["MPLBACKEND"] = "Agg"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+import matplotlib
+matplotlib.use("Agg", force=True)
 import math
 import argparse
 import pprint
@@ -20,8 +27,6 @@ import torch
 
 loguru_logger = get_rank_zero_only_logger(loguru_logger)
 
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
 
 def parse_args():
     # init a costum parser which will be added into pl.Trainer parser
@@ -133,7 +138,7 @@ def main():
     # Lightning Trainer
     trainer = pl.Trainer.from_argparse_args(
         args,
-        plugins=[DDPPlugin(find_unused_parameters=False,
+        plugins=[DDPPlugin(find_unused_parameters=True,
                           num_nodes=args.num_nodes,
                           sync_batchnorm=config.TRAINER.WORLD_SIZE > 0), NativeMixedPrecisionPlugin()],
         gradient_clip_val=config.TRAINER.GRADIENT_CLIPPING,

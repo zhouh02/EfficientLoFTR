@@ -8,13 +8,17 @@ PROJECT_DIR="${SCRIPTPATH}/../../"
 export PYTHONPATH=$PROJECT_DIR:$PYTHONPATH
 cd $PROJECT_DIR
 
+export MPLBACKEND=Agg
+export QT_QPA_PLATFORM=offscreen
+unset DISPLAY
+
 # to reproduced the results in our paper, please use:
 TRAIN_IMG_SIZE=832
 
 n_nodes=1
 n_gpus_per_node=3
 torch_num_workers=12
-batch_size=2
+batch_size=1
 pin_memory=true
 
 DEFAULT_EXP_NAME=''
@@ -22,6 +26,8 @@ EXP_NAME=${1:-${DEFAULT_EXP_NAME}}
 exp_name="outdoor-ds-${TRAIN_IMG_SIZE}-bs=$(($n_gpus_per_node * $n_nodes * $batch_size))-${EXP_NAME}"
 main_cfg_path="configs/loftr/eloftr_full.py"
 data_cfg_path="configs/data/megadepth_trainval_${TRAIN_IMG_SIZE}.py"
+
+# python -c "import matplotlib; print('matplotlib backend:', matplotlib.get_backend())"
 
 python -u ./train.py \
     ${data_cfg_path} \
@@ -35,7 +41,7 @@ python -u ./train.py \
     --limit_val_batches=1. \
     --num_sanity_val_steps=10 \
     --benchmark=True \
-    --max_epochs=30 \
+    --max_epochs=40 \
     --thr 0.1 \
     --disable_mp \
     --deter

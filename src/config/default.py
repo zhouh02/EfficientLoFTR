@@ -7,7 +7,7 @@ _CN.LOFTR.BACKBONE_TYPE = 'RepVGG'
 _CN.LOFTR.ALIGN_CORNER = False
 _CN.LOFTR.RESOLUTION = (8, 1)
 _CN.LOFTR.FINE_WINDOW_SIZE = 8  # window_size in fine_level, must be even
-_CN.LOFTR.MP = False
+_CN.LOFTR.MP = True # change because memory is over
 _CN.LOFTR.REPLACE_NAN = False
 _CN.LOFTR.EVAL_TIMES = 1
 _CN.LOFTR.HALF = False
@@ -49,7 +49,7 @@ _CN.LOFTR.FINE.LAYER_NAMES = ['cross'] * 1
 _CN.LOFTR.MATCH_FINE = CN()
 _CN.LOFTR.MATCH_FINE.SPARSE_SPVS = True
 _CN.LOFTR.MATCH_FINE.LOCAL_REGRESS_TEMPERATURE = 10.0  # ✅ 修改：1.0 -> 10.0 (CoMatch要求)
-_CN.LOFTR.MATCH_FINE.LOCAL_REGRESS_SLICEDIM = 64  # ✅ 修改：8 -> 64 (高精度，如果显存不足可改回8)
+_CN.LOFTR.MATCH_FINE.LOCAL_REGRESS_SLICEDIM = 8  # ✅ 修改：8 -> 64 (高精度，如果显存不足可改回8)
 
 # 边界约束配置（保留你的原始配置）
 _CN.LOFTR.MATCH_FINE.MAX_OFFSET_RATIO = 1.5
