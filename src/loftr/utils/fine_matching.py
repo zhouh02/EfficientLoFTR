@@ -19,6 +19,27 @@ class FineMatching(nn.Module):
         self.fp16 = config['half']
         self.validate = False
 
+        # PCCR (Pairwise-Conditioned Consensus Refinement) configuration
+        match_fine_cfg = config.get('match_fine', {})
+        self.pccr_refinement = match_fine_cfg.get('pccr_refinement', True)
+        self.pccr_alpha = float(match_fine_cfg.get('pccr_alpha', 0.5))
+        self.pccr_gamma = float(match_fine_cfg.get('pccr_gamma', 0.0))
+        self.pccr_use_pair_prior = bool(match_fine_cfg.get('pccr_use_pair_prior', False))
+
+    def _get_temperature(self, ref_tensor):
+        """Safely return temperature as a tensor on the same device/dtype as ``ref_tensor``.
+
+        ``self.local_regress_temperature`` may be a Python float (when overridden) or
+        a ``torch.Tensor`` / ``nn.Parameter``. We coerce it to a tensor, clamp to a
+        positive minimum for numerical safety, and move it to the right device.
+        """
+        temp = self.local_regress_temperature
+        if not torch.is_tensor(temp):
+            temp = torch.tensor(float(temp), device=ref_tensor.device, dtype=ref_tensor.dtype)
+        else:
+            temp = temp.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        return temp.clamp_min(1e-4)
+
     def forward(self, feat_0, feat_1, data):
         """
         Args:
@@ -120,24 +141,77 @@ class FineMatching(nn.Module):
         # CoMatch 核心：使用中心点特征的平均值作为查询向量
         feat_ff0_center = feat_ff0_local[:, 4, :]  # 中心点 index = 4 (9//2)
         feat_ff1_center = feat_ff1_local[:, 4, :]
-        avg_feat_center = (feat_ff0_center + feat_ff1_center) / 2.0
 
         # 双向计算 confidence matrix
         with torch.autocast(enabled=True if not (self.training or self.validate) else False, device_type='cuda'):
             # 归一化
             feat_ff0_local_norm = feat_ff0_local / (self.local_regress_slicedim ** 0.5)
             feat_ff1_local_norm = feat_ff1_local / (self.local_regress_slicedim ** 0.5)
-            
-            # 对左图的 3x3 邻域计算相似度
-            conf_matrix_ff0 = torch.einsum('mc,mrc->mr', avg_feat_center, feat_ff0_local_norm)
-            # 对右图的 3x3 邻域计算相似度
-            conf_matrix_ff1 = torch.einsum('mc,mrc->mr', avg_feat_center, feat_ff1_local_norm)
+            # 中心点归一化（用于构造 consensus vector）
+            eps = 1e-8
+            left_center_norm = F.normalize(feat_ff0_center, dim=-1, eps=eps)
+            right_center_norm = F.normalize(feat_ff1_center, dim=-1, eps=eps)
+
+            if self.pccr_refinement:
+                # -------- PCCR: Pairwise-Conditioned Consensus Refinement --------
+                # Step 1: initial consensus vector m0
+                m0 = F.normalize(0.5 * (left_center_norm + right_center_norm), dim=-1, eps=eps)
+
+                # Step 2: m0 produces initial self-side probability over the 3x3 patch
+                score_left_0 = torch.einsum('mc,mrc->mr', m0, feat_ff0_local_norm)
+                score_right_0 = torch.einsum('mc,mrc->mr', m0, feat_ff1_local_norm)
+                # `m0` is already in the normalized feature space, so the
+                # L2-normalized patch features are exactly the cosine similarities.
+                prob_left_0 = F.softmax(score_left_0, dim=-1)
+                prob_right_0 = F.softmax(score_right_0, dim=-1)
+
+                # Step 3: pairwise correspondence matrix between left and right 3x3 patches
+                pair_corr = torch.bmm(
+                    feat_ff0_local_norm, feat_ff1_local_norm.transpose(1, 2)
+                )  # [n_matches, 9, 9]
+
+                # Step 4: condition pairwise logits with m0-induced marginals
+                pair_logit = pair_corr + torch.log(prob_left_0.unsqueeze(2) + eps) \
+                                       + torch.log(prob_right_0.unsqueeze(1) + eps)
+                pair_prob = F.softmax(pair_logit.flatten(1), dim=-1).reshape(-1, 9, 9)
+
+                # Step 5: marginalize to obtain pairwise-supported local weights
+                pair_left_weight = pair_prob.sum(dim=2)   # [n_matches, 9]
+                pair_right_weight = pair_prob.sum(dim=1)  # [n_matches, 9]
+
+                # Step 6: aggregate local patch features using the pairwise weights
+                cons_left = (pair_left_weight.unsqueeze(-1) * feat_ff0_local_norm).sum(dim=1)
+                cons_right = (pair_right_weight.unsqueeze(-1) * feat_ff1_local_norm).sum(dim=1)
+
+                # Step 7: pairwise-conditioned consensus vector
+                m_pair = F.normalize(0.5 * (cons_left + cons_right), dim=-1, eps=eps)
+
+                # Step 8: residual update of the consensus vector
+                m1 = F.normalize(m0 + self.pccr_alpha * m_pair, dim=-1, eps=eps)
+
+                # Step 9: final per-side similarity from m1
+                score_left = torch.einsum('mc,mrc->mr', m1, feat_ff0_local_norm)
+                score_right = torch.einsum('mc,mrc->mr', m1, feat_ff1_local_norm)
+
+                # Step 10: optional pairwise marginal prior
+                if self.pccr_use_pair_prior:
+                    score_left = score_left + self.pccr_gamma * torch.log(pair_left_weight + eps)
+                    score_right = score_right + self.pccr_gamma * torch.log(pair_right_weight + eps)
+
+                conf_matrix_ff0 = score_left
+                conf_matrix_ff1 = score_right
+            else:
+                # -------- Fallback: original bilateral refinement --------
+                avg_feat_center = (feat_ff0_center + feat_ff1_center) / 2.0
+                conf_matrix_ff0 = torch.einsum('mc,mrc->mr', avg_feat_center, feat_ff0_local_norm)
+                conf_matrix_ff1 = torch.einsum('mc,mrc->mr', avg_feat_center, feat_ff1_local_norm)
 
         # 应用温度参数并 softmax
         conf_matrix_ff0 = conf_matrix_ff0.reshape(-1, 9)
         conf_matrix_ff1 = conf_matrix_ff1.reshape(-1, 9)
-        heatmap0 = F.softmax(conf_matrix_ff0 / self.local_regress_temperature, -1).reshape(-1, 3, 3)
-        heatmap1 = F.softmax(conf_matrix_ff1 / self.local_regress_temperature, -1).reshape(-1, 3, 3)
+        temperature = self._get_temperature(conf_matrix_ff0)
+        heatmap0 = F.softmax(conf_matrix_ff0 / temperature, -1).reshape(-1, 3, 3)
+        heatmap1 = F.softmax(conf_matrix_ff1 / temperature, -1).reshape(-1, 3, 3)
 
         # 从 heatmap 计算归一化坐标 (使用 DSNT)
         coords_normalized0 = dsnt.spatial_expectation2d(heatmap0[None], True)[0]
