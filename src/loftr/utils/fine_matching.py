@@ -19,6 +19,24 @@ class FineMatching(nn.Module):
         self.fp16 = config['half']
         self.validate = False
 
+        # SMNN (Sub-pixel Mutual Nearest Neighbor) refinement config
+        # Parameter-free inference-only refinement; safe to load existing checkpoints.
+        self.smnn_refinement = config['match_fine'].get('smnn_refinement', True)
+        self.smnn_lambda_pair = config['match_fine'].get('smnn_lambda_pair', 1.0)
+        self.smnn_lambda_self = config['match_fine'].get('smnn_lambda_self', 0.5)
+        self.smnn_lambda_center = config['match_fine'].get('smnn_lambda_center', 0.0)
+        self.smnn_temperature = config['match_fine'].get('smnn_temperature', 1.0)
+        self.smnn_debug = config['match_fine'].get('smnn_debug', False)
+
+    def _as_tensor_on(self, value, ref_tensor, min_value=1e-4):
+        """Convert a scalar/tensor value to a tensor on the same device/dtype as ref_tensor,
+        and clamp it to be >= min_value (used for temperatures to avoid division by zero)."""
+        if isinstance(value, torch.Tensor):
+            t = value.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        else:
+            t = torch.tensor(float(value), device=ref_tensor.device, dtype=ref_tensor.dtype)
+        return t.clamp_min(min_value)
+
     def forward(self, feat_0, feat_1, data):
         """
         Args:
@@ -117,27 +135,96 @@ class FineMatching(nn.Module):
         feat_ff0_local = feat_ff0[m_ids_expanded, idx_l_iids_grid, idx_l_jids_grid].view(-1, 9, self.local_regress_slicedim)
         feat_ff1_local = feat_ff1[m_ids_expanded, idx_r_iids_grid, idx_r_jids_grid].view(-1, 9, self.local_regress_slicedim)
 
-        # CoMatch 核心：使用中心点特征的平均值作为查询向量
+        # 中心点特征提取（SMNN 与 CoMatch fallback 都使用）
         feat_ff0_center = feat_ff0_local[:, 4, :]  # 中心点 index = 4 (9//2)
         feat_ff1_center = feat_ff1_local[:, 4, :]
-        avg_feat_center = (feat_ff0_center + feat_ff1_center) / 2.0
 
         # 双向计算 confidence matrix
         with torch.autocast(enabled=True if not (self.training or self.validate) else False, device_type='cuda'):
-            # 归一化
-            feat_ff0_local_norm = feat_ff0_local / (self.local_regress_slicedim ** 0.5)
-            feat_ff1_local_norm = feat_ff1_local / (self.local_regress_slicedim ** 0.5)
-            
-            # 对左图的 3x3 邻域计算相似度
-            conf_matrix_ff0 = torch.einsum('mc,mrc->mr', avg_feat_center, feat_ff0_local_norm)
-            # 对右图的 3x3 邻域计算相似度
-            conf_matrix_ff1 = torch.einsum('mc,mrc->mr', avg_feat_center, feat_ff1_local_norm)
+            if self.smnn_refinement:
+                # SMNN: 直接在左右 3x3 patch 之间构造 pairwise similarity，
+                # 做 soft mutual nearest neighbor normalization，再边缘化得到左右 heatmap。
+                # 与 CoMatch 不同，左右 heatmap 是 coupled 的（共享 mutual_prob）。
 
-        # 应用温度参数并 softmax
-        conf_matrix_ff0 = conf_matrix_ff0.reshape(-1, 9)
-        conf_matrix_ff1 = conf_matrix_ff1.reshape(-1, 9)
-        heatmap0 = F.softmax(conf_matrix_ff0 / self.local_regress_temperature, -1).reshape(-1, 3, 3)
-        heatmap1 = F.softmax(conf_matrix_ff1 / self.local_regress_temperature, -1).reshape(-1, 3, 3)
+                # 1) L2 归一化（cosine-style 相似度）
+                left_patch_norm = F.normalize(feat_ff0_local, dim=-1, eps=1e-8)
+                right_patch_norm = F.normalize(feat_ff1_local, dim=-1, eps=1e-8)
+
+                # 2) 取左右中心特征
+                left_center_norm = left_patch_norm[:, 4, :]
+                right_center_norm = right_patch_norm[:, 4, :]
+
+                # 3) 构造 normalized center consensus（弱先验）
+                center_vec = F.normalize(
+                    0.5 * (left_center_norm + right_center_norm),
+                    dim=-1,
+                    eps=1e-8
+                )
+
+                # 4) pairwise similarity: [N, 9, 9]
+                pair_score = torch.einsum("nic,njc->nij", left_patch_norm, right_patch_norm)
+
+                # 5) 中心共识向量对左右候选点的 self score
+                score_left = torch.einsum("nc,nic->ni", center_vec, left_patch_norm)   # [N, 9]
+                score_right = torch.einsum("nc,njc->nj", center_vec, right_patch_norm)  # [N, 9]
+
+                # 6) 构造 joint_score
+                joint_score = (
+                    self.smnn_lambda_pair * pair_score
+                    + self.smnn_lambda_self * score_left.unsqueeze(2)
+                    + self.smnn_lambda_self * score_right.unsqueeze(1)
+                )  # [N, 9, 9]
+
+                # 7) 可选的中心距离惩罚（默认关闭）
+                if self.smnn_lambda_center > 0:
+                    grid = create_meshgrid(3, 3, True, left_patch_norm.device)
+                    grid = grid.reshape(9, 2).to(dtype=left_patch_norm.dtype)
+                    center_cost = grid.pow(2).sum(dim=-1)  # [9]
+                    joint_center_cost = (
+                        center_cost[None, :, None] + center_cost[None, None, :]
+                    )  # [1, 9, 9]
+                    joint_score = joint_score - self.smnn_lambda_center * joint_center_cost
+
+                # 8) soft mutual nearest neighbor normalization
+                temp = self._as_tensor_on(self.smnn_temperature, joint_score, min_value=1e-4)
+                row_prob = F.softmax(joint_score / temp, dim=2)  # left -> right
+                col_prob = F.softmax(joint_score / temp, dim=1)  # right -> left
+                mutual_prob = row_prob * col_prob
+                mutual_prob = mutual_prob / (
+                    mutual_prob.sum(dim=(1, 2), keepdim=True) + 1e-8
+                )  # [N, 9, 9]
+
+                # 9) 边缘化得到左右 heatmap（coupled）
+                prob_left = mutual_prob.sum(dim=2)    # [N, 9]
+                prob_right = mutual_prob.sum(dim=1)   # [N, 9]
+                heatmap0 = prob_left.reshape(-1, 3, 3)
+                heatmap1 = prob_right.reshape(-1, 3, 3)
+
+                # 可选 debug：避免默认写入 mutual_prob 占据显存
+                if self.smnn_debug:
+                    data.update({
+                        "smnn_heatmap0_max": heatmap0.reshape(-1, 9).max(dim=-1)[0].detach(),
+                        "smnn_heatmap1_max": heatmap1.reshape(-1, 9).max(dim=-1)[0].detach(),
+                        "smnn_mutual_prob_max": mutual_prob.reshape(-1, 81).max(dim=-1)[0].detach(),
+                    })
+            else:
+                # CoMatch-style fallback：使用中心点特征的平均值作为查询向量，分别生成左右 heatmap。
+                avg_feat_center = (feat_ff0_center + feat_ff1_center) / 2.0
+
+                # 归一化
+                feat_ff0_local_norm = feat_ff0_local / (self.local_regress_slicedim ** 0.5)
+                feat_ff1_local_norm = feat_ff1_local / (self.local_regress_slicedim ** 0.5)
+
+                # 对左图的 3x3 邻域计算相似度
+                conf_matrix_ff0 = torch.einsum('mc,mrc->mr', avg_feat_center, feat_ff0_local_norm)
+                # 对右图的 3x3 邻域计算相似度
+                conf_matrix_ff1 = torch.einsum('mc,mrc->mr', avg_feat_center, feat_ff1_local_norm)
+
+                # 应用温度参数并 softmax
+                conf_matrix_ff0 = conf_matrix_ff0.reshape(-1, 9)
+                conf_matrix_ff1 = conf_matrix_ff1.reshape(-1, 9)
+                heatmap0 = F.softmax(conf_matrix_ff0 / self.local_regress_temperature, -1).reshape(-1, 3, 3)
+                heatmap1 = F.softmax(conf_matrix_ff1 / self.local_regress_temperature, -1).reshape(-1, 3, 3)
 
         # 从 heatmap 计算归一化坐标 (使用 DSNT)
         coords_normalized0 = dsnt.spatial_expectation2d(heatmap0[None], True)[0]

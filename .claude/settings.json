@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(ls d:/GitCode/ 2>/dev/null | head -30)",
-      "Read(//d/GitCode/**)"
+      "Read(//d/GitCode/**)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/loftr/utils/fine_matching.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
