@@ -386,6 +386,8 @@ def aggregate_metrics(metrics, epi_err_thr=1e-4, config=None):
     (This method should be called once per dataset)
     1. AUC of the pose error (angular) at the threshold [5, 10, 20]
     2. Mean matching precision at the threshold 5e-4(ScanNet), 1e-4(MegaDepth)
+    3. Additional precision thresholds: 1e-4, 5e-4, 1e-3
+    4. Median and mean epipolar error
     """
     # filter duplicates
     unq_ids = OrderedDict((iden, id) for id, iden in enumerate(metrics['identifiers']))
@@ -401,10 +403,39 @@ def aggregate_metrics(metrics, epi_err_thr=1e-4, config=None):
         pose_errors = np.max(np.stack([metrics['R_errs'], metrics['t_errs']]), axis=0)[unq_ids]
     aucs = error_auc(pose_errors, angular_thresholds)  # (auc@5, auc@10, auc@20)
 
-    # matching precision
-    dist_thresholds = [epi_err_thr]
-    precs = epidist_prec(np.array(metrics['epi_errs'], dtype=object)[unq_ids], dist_thresholds, True)  # (prec@err_thr)
-    
+    # matching precision at multiple thresholds
+    dist_thresholds = sorted({
+        float(epi_err_thr),
+        1e-4,
+        5e-4,
+        1e-3,
+    })
+    epi_errs_unique = np.asarray(
+        metrics["epi_errs"],
+        dtype=object,
+    )[unq_ids]
+    precs = epidist_prec(epi_errs_unique, dist_thresholds, True)  # (prec@err_thr)
+
+    # 中位数 / 均值 epipolar error（与 precision 使用同一份去重后的 epi_errs_unique）
+    epi_errs_flat = np.concatenate(
+        [np.asarray(errs, dtype=np.float64).reshape(-1) for errs in epi_errs_unique]
+    ) if len(epi_errs_unique) > 0 else np.asarray([], dtype=np.float64)
+    if epi_errs_flat.size > 0:
+        epi_stats = {
+            'median_epierr': float(np.median(epi_errs_flat)),
+            'mean_epierr': float(np.mean(epi_errs_flat)),
+        }
+    else:
+        epi_stats = {
+            'median_epierr': float('nan'),
+            'mean_epierr': float('nan'),
+        }
+
     u_num_mathces = np.array(metrics['num_matches'], dtype=object)[unq_ids]
     num_matches = {f'num_matches': u_num_mathces.mean() }
-    return {**aucs, **precs, **num_matches}
+    return {
+        **aucs,
+        **precs,
+        **num_matches,
+        **epi_stats,
+    }

@@ -19,11 +19,13 @@ from src.utils.metrics import (
     aggregate_metrics
 )
 from src.utils.plotting import make_matching_figures
-from src.utils.comm import gather, all_gather
+from src.utils.comm import gather, all_gather, get_rank, get_world_size, is_main_process
 from src.utils.misc import lower_config, flattenList
 from src.utils.profiler import PassThroughProfiler
 
 from torch.profiler import profile
+import os
+import json
 
 def reparameter(matcher):
     module = matcher.backbone.layer0
@@ -70,6 +72,18 @@ class PL_LoFTR(pl.LightningModule):
         self.start_event = torch.cuda.Event(enable_timing=True)
         self.end_event = torch.cuda.Event(enable_timing=True)
         self.total_ms = 0
+        self.timed_sample_count = 0  # Track actual timed samples
+
+        # SMNN debug metrics aggregation
+        self.smnn_debug_sums = {}
+        self.smnn_debug_counts = {}
+
+        # Peak memory tracking
+        self._test_peak_memory_reset = False
+        self.peak_mem_bytes = 0
+
+        # Dump directory for JSON output
+        self.dump_dir = dump_dir
 
         for p in self.parameters():
             if p.requires_grad:
@@ -135,6 +149,17 @@ class PL_LoFTR(pl.LightningModule):
             'inliers': batch['inliers'],
             'num_matches': [batch['mconf'].shape[0]], # batch size = 1 only
             }
+
+        # Collect SMNN debug metrics if present
+        smnn_debug_keys = [
+            'smnn_heatmap0_max', 'smnn_heatmap1_max', 'smnn_mutual_prob_max',
+            'smnn_heatmap0_entropy', 'smnn_heatmap1_entropy',
+            'smnn_offset_mag0', 'smnn_offset_mag1'
+        ]
+        for key in smnn_debug_keys:
+            if key in batch:
+                metrics[key] = batch[key].cpu().numpy()
+
         ret_dict = {'metrics': metrics}
         return ret_dict, rel_pair_names
     
@@ -248,12 +273,18 @@ class PL_LoFTR(pl.LightningModule):
             self.warmup = True
             torch.cuda.synchronize()
 
+            # Reset peak memory after warmup, only once per test run
+            if torch.cuda.is_available() and not self._test_peak_memory_reset:
+                torch.cuda.reset_peak_memory_stats()
+                self._test_peak_memory_reset = True
+
         if self.config.LOFTR.HALF:
             self.start_event.record()
             self.matcher(batch)
             self.end_event.record()
             torch.cuda.synchronize()
             self.total_ms += self.start_event.elapsed_time(self.end_event)
+            self.timed_sample_count += batch['image0'].size(0)
         else:
             with torch.autocast(enabled=self.config.LOFTR.MP, device_type='cuda'):
                 self.start_event.record()
@@ -261,6 +292,7 @@ class PL_LoFTR(pl.LightningModule):
                 self.end_event.record()
                 torch.cuda.synchronize()
                 self.total_ms += self.start_event.elapsed_time(self.end_event)
+                self.timed_sample_count += batch['image0'].size(0)
 
         ret_dict, rel_pair_names = self._compute_metrics(batch)
         return ret_dict
@@ -270,8 +302,88 @@ class PL_LoFTR(pl.LightningModule):
         _metrics = [o['metrics'] for o in outputs]
         metrics = {k: flattenList(gather(flattenList([_me[k] for _me in _metrics]))) for k in _metrics[0]}
 
+        # Aggregate SMNN debug metrics if present
+        smnn_debug_keys = [
+            'smnn_heatmap0_max', 'smnn_heatmap1_max', 'smnn_mutual_prob_max',
+            'smnn_heatmap0_entropy', 'smnn_heatmap1_entropy',
+            'smnn_offset_mag0', 'smnn_offset_mag1'
+        ]
+        smnn_debug_means = {}
+        for key in smnn_debug_keys:
+            if key in metrics:
+                values = np.concatenate([v.reshape(-1) for v in metrics[key]])
+                if len(values) > 0:
+                    smnn_debug_means[f'{key}_mean'] = float(np.mean(values))
+                else:
+                    smnn_debug_means[f'{key}_mean'] = float('nan')
+
+        # Aggregate timing across all ranks
+        total_ms_tensor = torch.tensor(self.total_ms, dtype=torch.float64)
+        timed_sample_count_tensor = torch.tensor(self.timed_sample_count, dtype=torch.int64)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(total_ms_tensor, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(timed_sample_count_tensor, op=torch.distributed.ReduceOp.SUM)
+
+        # Peak memory: each rank reports its peak, take max across ranks
+        if torch.cuda.is_available():
+            peak_mem = torch.cuda.max_memory_allocated()
+            peak_mem_tensor = torch.tensor(peak_mem, dtype=torch.int64)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(peak_mem_tensor, op=torch.distributed.ReduceOp.MAX)
+            peak_mem_mb = float(peak_mem_tensor.item()) / (1024 ** 2)
+        else:
+            peak_mem_mb = None
+
         # [{key: [{...}, *#bs]}, *#batch]
-        if self.trainer.global_rank == 0:
-            print('Averaged Matching time over 1500 pairs: {:.2f} ms'.format(self.total_ms / 1500))
+        if is_main_process():
+            # Aggregate metrics
             val_metrics_4tb = aggregate_metrics(metrics, self.config.TRAINER.EPI_ERR_THR, config=self.config)
+
+            # Add SMNN debug metrics
+            val_metrics_4tb.update(smnn_debug_means)
+
+            # Compute timing metric
+            total_timed_samples = timed_sample_count_tensor.item()
+            avg_inference_ms_per_pair = (
+                total_ms_tensor.item() / max(total_timed_samples, 1)
+                if total_timed_samples > 0 else 0.0
+            )
+            val_metrics_4tb['avg_inference_ms_per_pair'] = avg_inference_ms_per_pair
+
+            # Add peak memory
+            val_metrics_4tb['peak_mem_mb'] = peak_mem_mb
+
             logger.info('\n' + pprint.pformat(val_metrics_4tb))
+
+            # Export to JSON
+            if self.dump_dir is not None:
+                os.makedirs(self.dump_dir, exist_ok=True)
+                json_path = os.path.join(self.dump_dir, 'smnn_metrics.json')
+
+                # Safe conversion helper
+                def to_json_serializable(obj):
+                    if isinstance(obj, torch.Tensor):
+                        if obj.numel() == 1:
+                            return obj.item()
+                        else:
+                            return obj.cpu().tolist()
+                    elif isinstance(obj, np.ndarray):
+                        if obj.size == 1:
+                            return obj.item()
+                        else:
+                            return obj.tolist()
+                    elif isinstance(obj, np.generic):
+                        return obj.item()
+                    elif isinstance(obj, (int, float, str, bool, type(None))):
+                        return obj
+                    elif isinstance(obj, dict):
+                        return {k: to_json_serializable(v) for k, v in obj.items()}
+                    elif isinstance(obj, (list, tuple)):
+                        return [to_json_serializable(item) for item in obj]
+                    else:
+                        return str(obj)
+
+                serializable_metrics = to_json_serializable(val_metrics_4tb)
+                with open(json_path, 'w') as f:
+                    json.dump(serializable_metrics, f, indent=2)
+                logger.info(f"Saved metrics to {json_path}")

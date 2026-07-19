@@ -146,6 +146,18 @@ class FineMatching(nn.Module):
                 # 做 soft mutual nearest neighbor normalization，再边缘化得到左右 heatmap。
                 # 与 CoMatch 不同，左右 heatmap 是 coupled 的（共享 mutual_prob）。
 
+                # 0) 局部 patch shape 校验：必须为 [N, 9, C]
+                assert (
+                    feat_ff0_local.dim() == 3
+                    and feat_ff1_local.dim() == 3
+                    and feat_ff0_local.shape[1] == 9
+                    and feat_ff1_local.shape[1] == 9
+                ), (
+                    "SMNN expects local patches with shape [N, 9, C], "
+                    f"got left={tuple(feat_ff0_local.shape)}, "
+                    f"right={tuple(feat_ff1_local.shape)}"
+                )
+
                 # 1) L2 归一化（cosine-style 相似度）
                 left_patch_norm = F.normalize(feat_ff0_local, dim=-1, eps=1e-8)
                 right_patch_norm = F.normalize(feat_ff1_local, dim=-1, eps=1e-8)
@@ -201,7 +213,7 @@ class FineMatching(nn.Module):
                 heatmap1 = prob_right.reshape(-1, 3, 3)
 
                 # 可选 debug：避免默认写入 mutual_prob 占据显存
-                if self.smnn_debug:
+                if self.smnn_debug and self.smnn_refinement:
                     data.update({
                         "smnn_heatmap0_max": heatmap0.reshape(-1, 9).max(dim=-1)[0].detach(),
                         "smnn_heatmap1_max": heatmap1.reshape(-1, 9).max(dim=-1)[0].detach(),
@@ -229,7 +241,35 @@ class FineMatching(nn.Module):
         # 从 heatmap 计算归一化坐标 (使用 DSNT)
         coords_normalized0 = dsnt.spatial_expectation2d(heatmap0[None], True)[0]
         coords_normalized1 = dsnt.spatial_expectation2d(heatmap1[None], True)[0]
-        
+
+        # SMNN debug：在乘实际 scale / 最终坐标更新之前，计算 heatmap entropy 与 DSNT offset magnitude
+        if self.smnn_debug and self.smnn_refinement:
+            eps = 1e-12
+
+            h0 = heatmap0.reshape(-1, 9).float()
+            h1 = heatmap1.reshape(-1, 9).float()
+
+            h0 = h0 / h0.sum(dim=-1, keepdim=True).clamp_min(eps)
+            h1 = h1 / h1.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+            entropy0 = -(
+                h0.clamp_min(eps) * h0.clamp_min(eps).log()
+            ).sum(dim=-1) / math.log(9.0)
+
+            entropy1 = -(
+                h1.clamp_min(eps) * h1.clamp_min(eps).log()
+            ).sum(dim=-1) / math.log(9.0)
+
+            offset_mag0 = coords_normalized0.float().norm(dim=-1)
+            offset_mag1 = coords_normalized1.float().norm(dim=-1)
+
+            data.update({
+                "smnn_heatmap0_entropy": entropy0.detach(),
+                "smnn_heatmap1_entropy": entropy1.detach(),
+                "smnn_offset_mag0": offset_mag0.detach(),
+                "smnn_offset_mag1": offset_mag1.detach(),
+            })
+
         # 处理 scale
         if data['bs'] == 1:
             scale0 = scale * data['scale0'] if 'scale0' in data else scale
