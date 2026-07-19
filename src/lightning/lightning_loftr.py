@@ -317,22 +317,54 @@ class PL_LoFTR(pl.LightningModule):
                 else:
                     smnn_debug_means[f'{key}_mean'] = float('nan')
 
-        # Aggregate timing across all ranks
-        total_ms_tensor = torch.tensor(self.total_ms, dtype=torch.float64)
-        timed_sample_count_tensor = torch.tensor(self.timed_sample_count, dtype=torch.int64)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(total_ms_tensor, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(timed_sample_count_tensor, op=torch.distributed.ReduceOp.SUM)
+        # Aggregate timing / peak-memory across ranks.
+        # NCCL only supports CUDA tensors, so the reduce device must follow the active backend.
+        dist_ready = (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        world_size = torch.distributed.get_world_size() if dist_ready else 1
+
+        total_ms_value = float(self.total_ms)
+        timed_sample_count_value = float(self.timed_sample_count)
 
         # Peak memory: each rank reports its peak, take max across ranks
         if torch.cuda.is_available():
-            peak_mem = torch.cuda.max_memory_allocated()
-            peak_mem_tensor = torch.tensor(peak_mem, dtype=torch.int64)
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.all_reduce(peak_mem_tensor, op=torch.distributed.ReduceOp.MAX)
-            peak_mem_mb = float(peak_mem_tensor.item()) / (1024 ** 2)
+            peak_mem_bytes_value = float(torch.cuda.max_memory_allocated())
         else:
-            peak_mem_mb = None
+            peak_mem_bytes_value = 0.0
+
+        # Only run collectives when there is more than one rank.
+        if dist_ready and world_size > 1:
+            backend = torch.distributed.get_backend()
+            # NCCL requires CUDA tensors; other backends (e.g. gloo) may use CPU.
+            if backend == "nccl":
+                reduce_device = next(self.parameters()).device
+            else:
+                reduce_device = torch.device("cpu")
+
+            # timing + count aggregated together with SUM
+            timing_stats = torch.tensor(
+                [total_ms_value, timed_sample_count_value],
+                dtype=torch.float64,
+                device=reduce_device,
+            )
+            torch.distributed.all_reduce(timing_stats, op=torch.distributed.ReduceOp.SUM)
+            total_ms_value = float(timing_stats[0].item())
+            timed_sample_count_value = float(timing_stats[1].item())
+
+            # peak memory aggregated with MAX
+            peak_mem_tensor = torch.tensor(
+                peak_mem_bytes_value,
+                dtype=torch.float64,
+                device=reduce_device,
+            )
+            torch.distributed.all_reduce(peak_mem_tensor, op=torch.distributed.ReduceOp.MAX)
+            peak_mem_bytes_value = float(peak_mem_tensor.item())
+
+        peak_mem_mb = (
+            peak_mem_bytes_value / (1024.0 ** 2) if torch.cuda.is_available() else None
+        )
 
         # [{key: [{...}, *#bs]}, *#batch]
         if is_main_process():
@@ -343,11 +375,7 @@ class PL_LoFTR(pl.LightningModule):
             val_metrics_4tb.update(smnn_debug_means)
 
             # Compute timing metric
-            total_timed_samples = timed_sample_count_tensor.item()
-            avg_inference_ms_per_pair = (
-                total_ms_tensor.item() / max(total_timed_samples, 1)
-                if total_timed_samples > 0 else 0.0
-            )
+            avg_inference_ms_per_pair = total_ms_value / max(timed_sample_count_value, 1.0)
             val_metrics_4tb['avg_inference_ms_per_pair'] = avg_inference_ms_per_pair
 
             # Add peak memory
